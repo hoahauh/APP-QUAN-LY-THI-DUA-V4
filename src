@@ -1,0 +1,542 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect } from 'react';
+import { UserRole, ClassData, IncidentRecord, EmulationCampaign, AuditLogEntry, GoogleSheetConfig } from './types';
+import {
+  INITIAL_CLASSES,
+  INITIAL_INCIDENTS,
+  INITIAL_CAMPAIGNS,
+  INITIAL_AUDIT_LOGS,
+} from './data/mockData';
+import { Header } from './components/Header';
+import { LeaderboardView } from './components/LeaderboardView';
+import { RedScarfInspectionView } from './components/RedScarfInspectionView';
+import { DisputeResolutionView } from './components/DisputeResolutionView';
+import { CampaignConfigView } from './components/CampaignConfigView';
+import { AwardsReportModal } from './components/AwardsReportModal';
+import { EduEmulateAIChatModal } from './components/EduEmulateAIChatModal';
+import { ClassDetailModal } from './components/ClassDetailModal';
+import { GoogleSheetModal } from './components/GoogleSheetModal';
+import { ApiKeySettingsModal } from './components/ApiKeySettingsModal';
+import { loadGoogleSheetConfig, saveGoogleSheetConfig, fetchClassesFromGoogleSheet } from './services/googleSheetService';
+import { getStoredApiKey } from './services/geminiService';
+import { Sparkles, Award, Shield, Clock, Zap } from 'lucide-react';
+
+export default function App() {
+  const [currentRole, setCurrentRole] = useState<UserRole>('bgh');
+  const [activeTab, setActiveTab] = useState<string>('leaderboard');
+  const [classes, setClasses] = useState<ClassData[]>(INITIAL_CLASSES);
+  const [incidents, setIncidents] = useState<IncidentRecord[]>(INITIAL_INCIDENTS);
+  const [campaigns, setCampaigns] = useState<EmulationCampaign[]>(INITIAL_CAMPAIGNS);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(INITIAL_AUDIT_LOGS);
+
+  const [selectedClassId, setSelectedClassId] = useState<string>(INITIAL_CLASSES[0].id);
+  const [selectedClassForModal, setSelectedClassForModal] = useState<ClassData | null>(null);
+
+  // Gemini API Key & Model Management strictly adhering to AI_INSTRUCTIONS.md
+  const [apiKey, setApiKey] = useState<string>(() => getStoredApiKey());
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
+  const [isApiKeyMandatory, setIsApiKeyMandatory] = useState(false);
+
+  // Show mandatory API key setup modal on first launch if not configured
+  useEffect(() => {
+    const key = getStoredApiKey();
+    if (!key) {
+      setIsApiKeyModalOpen(true);
+      setIsApiKeyMandatory(true);
+    }
+  }, []);
+
+  // Google Sheet Database State
+  const [googleSheetConfig, setGoogleSheetConfig] = useState<GoogleSheetConfig>(() => loadGoogleSheetConfig());
+  const [isSheetModalOpen, setIsSheetModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Modals
+  const [isAwardsModalOpen, setIsAwardsModalOpen] = useState(false);
+  const [isAIChatOpen, setIsAIChatOpen] = useState(false);
+  const [aiPresetPrompt, setAiPresetPrompt] = useState<string | undefined>();
+
+  // Auto-sync with Google Sheet in background if enabled
+  useEffect(() => {
+    if (!googleSheetConfig.autoSync || !googleSheetConfig.isConnected || !googleSheetConfig.sheetUrl) return;
+
+    const intervalMinutes = Math.max(1, googleSheetConfig.syncIntervalMinutes || 15);
+    const intervalMs = intervalMinutes * 60 * 1000;
+
+    const timer = setInterval(async () => {
+      try {
+        const result = await fetchClassesFromGoogleSheet(googleSheetConfig);
+        if (result.classes && result.classes.length > 0) {
+          setClasses(recalculateClassRanks(result.classes));
+          const timeStr = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+          const updated = { ...googleSheetConfig, lastSyncedAt: timeStr };
+          setGoogleSheetConfig(updated);
+          saveGoogleSheetConfig(updated);
+          setToastMessage(`Đã tự động đồng bộ ${result.classes.length} lớp từ Google Sheet (${timeStr})`);
+          setTimeout(() => setToastMessage(null), 4000);
+        }
+      } catch (e) {
+        console.warn('Background auto-sync failed:', e);
+      }
+    }, intervalMs);
+
+    return () => clearInterval(timer);
+  }, [googleSheetConfig]);
+
+  // Derived state
+  const activeCampaign = campaigns.find((c) => c.isActive && c.x2MultiplierActive);
+  const isX2Active = !!activeCampaign;
+  const alertCount = classes.filter((c) => c.sharpDropAlert).length;
+  const activeDisputeCount = incidents.filter(
+    (i) => i.status === 'disputed' || (i.status === 'submitted' && new Date(i.disputeWindowExpiresAt).getTime() > Date.now())
+  ).length;
+
+  // Re-rank classes whenever scores change
+  const recalculateClassRanks = (classList: ClassData[]): ClassData[] => {
+    const sorted = [...classList].sort((a, b) => b.totalScore - a.totalScore);
+    return sorted.map((item, idx) => {
+      const newRank = idx + 1;
+      const trend: 'up' | 'down' | 'stable' =
+        newRank < item.rank ? 'up' : newRank > item.rank ? 'down' : 'stable';
+      return {
+        ...item,
+        previousRank: item.rank,
+        rank: newRank,
+        trend,
+      };
+    });
+  };
+
+  // Add a new incident (from Red Scarf mobile inspection)
+  const handleAddIncident = (newInc: IncidentRecord) => {
+    setIncidents((prev) => [newInc, ...prev]);
+
+    // Update target class score
+    setClasses((prevClasses) => {
+      const updated = prevClasses.map((cls) => {
+        if (cls.id === newInc.classId) {
+          const newScore = Math.max(0, Math.min(100, cls.totalScore + newInc.points));
+          // Check sharp drop
+          const isSteep = newInc.points <= -5 || cls.sharpDropAlert;
+          return {
+            ...cls,
+            totalScore: Number(newScore.toFixed(1)),
+            sharpDropAlert: isSteep,
+            dropAmount: (cls.dropAmount || 0) + Math.abs(newInc.points < 0 ? newInc.points : 0),
+          };
+        }
+        return cls;
+      });
+      return recalculateClassRanks(updated);
+    });
+
+    // Add Audit Log
+    const newLog: AuditLogEntry = {
+      id: `log-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      user: newInc.inspectorName,
+      role: 'Đội Cờ Đỏ',
+      action: newInc.isVicariousPunishment ? 'ÁP DỤNG PHẠT LIÊN ĐỚI CỜ ĐỎ' : 'GHI NHẬN BIÊN BẢN THỰC ĐỊA',
+      details: `${newInc.title} cho lớp ${newInc.className} (${newInc.points > 0 ? '+' : ''}${newInc.points}đ). Tọa độ: ${newInc.gpsLocation.areaName}`,
+      signatureHash: `SHA256:${Math.random().toString(36).substring(2, 10)}...${Math.random().toString(36).substring(2, 6)}`,
+      mfaVerified: true,
+    };
+    setAuditLogs((prev) => [newLog, ...prev]);
+  };
+
+  // Submit a dispute (by GVCN within 24h window)
+  const handleSubmitDispute = (
+    incidentId: string,
+    gvcnName: string,
+    reason: string,
+    proofAttachmentName?: string
+  ) => {
+    setIncidents((prev) =>
+      prev.map((inc) => {
+        if (inc.id === incidentId) {
+          return {
+            ...inc,
+            status: 'disputed',
+            disputeDetails: {
+              gvcnName,
+              submittedAt: new Date().toISOString(),
+              reason,
+              proofAttachmentName: proofAttachmentName || 'Van_Ban_Xac_Minh.pdf',
+            },
+          };
+        }
+        return inc;
+      })
+    );
+
+    // Update class active dispute status
+    const targetInc = incidents.find((i) => i.id === incidentId);
+    if (targetInc) {
+      setClasses((prev) =>
+        prev.map((c) => (c.id === targetInc.classId ? { ...c, hasActiveDispute: true } : c))
+      );
+    }
+
+    // Add Audit Log
+    const newLog: AuditLogEntry = {
+      id: `log-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      user: gvcnName,
+      role: 'GVCN',
+      action: 'NỘP ĐƠN ĐỐI SOÁT KHIẾU NẠI (24H)',
+      details: `Khiếu nại biên bản ${incidentId}. Lý do: ${reason}`,
+      signatureHash: `SHA256:${Math.random().toString(36).substring(2, 10)}...${Math.random().toString(36).substring(2, 6)}`,
+      mfaVerified: true,
+    };
+    setAuditLogs((prev) => [newLog, ...prev]);
+  };
+
+  // Resolve a dispute (by BGH / Tổng Phụ Trách)
+  const handleResolveDispute = (
+    incidentId: string,
+    decision: 'upheld' | 'dismissed' | 'reduced_50',
+    decisionNote: string,
+    bghName: string
+  ) => {
+    const targetInc = incidents.find((i) => i.id === incidentId);
+    if (!targetInc) return;
+
+    let pointsRestored = 0;
+    if (decision === 'upheld') {
+      pointsRestored = Math.abs(targetInc.points); // Restore full penalty
+    } else if (decision === 'reduced_50') {
+      pointsRestored = Math.abs(targetInc.points) / 2; // Restore 50%
+    }
+
+    const digitalSig = `CVA-BGH-SIG:${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+
+    setIncidents((prev) =>
+      prev.map((inc) => {
+        if (inc.id === incidentId) {
+          return {
+            ...inc,
+            status: decision === 'upheld' ? 'resolved_upheld' : 'resolved_dismissed',
+            points: decision === 'upheld' ? 0 : decision === 'reduced_50' ? inc.points / 2 : inc.points,
+            disputeDetails: {
+              ...inc.disputeDetails!,
+              bghDecisionNote: decisionNote,
+              bghDecisionType: decision,
+              bghApprovedBy: bghName,
+              bghApprovedAt: new Date().toISOString(),
+              digitalSignatureHash: digitalSig,
+            },
+          };
+        }
+        return inc;
+      })
+    );
+
+    // If points restored, update class score
+    if (pointsRestored > 0) {
+      setClasses((prev) => {
+        const updated = prev.map((c) => {
+          if (c.id === targetInc.classId) {
+            const restored = Math.min(100, c.totalScore + pointsRestored);
+            return {
+              ...c,
+              totalScore: Number(restored.toFixed(1)),
+              hasActiveDispute: false,
+              sharpDropAlert: false,
+            };
+          }
+          return c;
+        });
+        return recalculateClassRanks(updated);
+      });
+    } else {
+      setClasses((prev) =>
+        prev.map((c) => (c.id === targetInc.classId ? { ...c, hasActiveDispute: false } : c))
+      );
+    }
+
+    // Add Audit Log
+    const newLog: AuditLogEntry = {
+      id: `log-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      user: bghName,
+      role: 'Ban Giám Hiệu',
+      action: 'PHÊ DUYỆT ĐỐI SOÁT & KÝ SỐ ĐIỆN TỬ',
+      details: `Quyết định: ${decision.toUpperCase()} đối với biên bản ${incidentId}. Hoàn trả: +${pointsRestored}đ. Ghi chú: ${decisionNote}`,
+      signatureHash: digitalSig,
+      mfaVerified: true,
+    };
+    setAuditLogs((prev) => [newLog, ...prev]);
+  };
+
+  // Toggle X2 campaign
+  const handleToggleX2 = (campaignId: string, newState: boolean) => {
+    setCampaigns((prev) =>
+      prev.map((c) => (c.id === campaignId ? { ...c, x2MultiplierActive: newState, isActive: newState } : c))
+    );
+
+    const camp = campaigns.find((c) => c.id === campaignId);
+    const newLog: AuditLogEntry = {
+      id: `log-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      user: 'admin_sys',
+      role: 'Admin',
+      action: newState ? 'KÍCH HOẠT CƠ CHẾ X2 ĐIỂM THƯỞNG' : 'HỦY KÍCH HOẠT CƠ CHẾ X2',
+      details: `Chiến dịch: ${camp?.title}`,
+      signatureHash: `SHA256:${Math.random().toString(36).substring(2, 10)}...${Math.random().toString(36).substring(2, 6)}`,
+      mfaVerified: true,
+    };
+    setAuditLogs((prev) => [newLog, ...prev]);
+  };
+
+  const handleOpenAIChatWithPrompt = (prompt?: string) => {
+    setAiPresetPrompt(prompt);
+    setIsAIChatOpen(true);
+  };
+
+  const handleAskAIForClass = (cls: ClassData) => {
+    handleOpenAIChatWithPrompt(
+      `Phân tích toàn diện chỉ số Radar 5 cạnh của lớp ${cls.name} (Hạng ${cls.rank}, ${cls.totalScore}đ, Nề nếp ${cls.radar.discipline}, Học tập ${cls.radar.academic}, Vệ sinh ${cls.radar.hygiene}). Lớp ${cls.sharpDropAlert ? 'đang bị cảnh báo tụt dốc >10đ' : 'đang duy trì thi đua ổn định'}. Đề xuất kế hoạch hành động cụ thể cho GVCN ${cls.gvcnName}.`
+    );
+  };
+
+  const handleNavigateToDispute = (classId?: string) => {
+    if (classId) setSelectedClassId(classId);
+    setActiveTab('disputes');
+  };
+
+  const handleSyncSuccess = (newClasses: ClassData[]) => {
+    const reRanked = recalculateClassRanks(newClasses);
+    setClasses(reRanked);
+    if (reRanked.length > 0) {
+      setSelectedClassId(reRanked[0].id);
+    }
+
+    const log: AuditLogEntry = {
+      id: `log-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      user: 'Google Sheet Sync',
+      role: 'Admin',
+      action: 'ĐỒNG BỘ CƠ SỞ DỮ LIỆU GOOGLE SHEET',
+      details: `Đồng bộ thành công ${newClasses.length} lớp học vào hệ thống thi đua liên đội`,
+      signatureHash: `GSHEET-SYNC:${Date.now()}`,
+      mfaVerified: true,
+    };
+    setAuditLogs((prev) => [log, ...prev]);
+
+    setToastMessage(`Đã cập nhật ${newClasses.length} lớp từ Google Sheet!`);
+    setTimeout(() => setToastMessage(null), 4000);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100/70 text-slate-900 flex flex-col font-sans">
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed top-14 right-4 sm:right-6 z-50 bg-emerald-700 text-white font-bold text-xs px-4 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 border border-emerald-500 animate-in slide-in-from-top-3">
+          <span className="w-2.5 h-2.5 rounded-full bg-emerald-300 animate-ping" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Header with Role Selector, Google Sheet button, Ticker & Nav */}
+      <Header
+        currentRole={currentRole}
+        onRoleChange={setCurrentRole}
+        onOpenAIChat={handleOpenAIChatWithPrompt}
+        onOpenAwardsModal={() => setIsAwardsModalOpen(true)}
+        onOpenGoogleSheetModal={() => setIsSheetModalOpen(true)}
+        onOpenApiKeyModal={() => {
+          setIsApiKeyMandatory(false);
+          setIsApiKeyModalOpen(true);
+        }}
+        hasApiKey={!!apiKey}
+        isSheetConnected={googleSheetConfig.isConnected}
+        sheetLastSyncedAt={googleSheetConfig.lastSyncedAt}
+        alertCount={alertCount}
+        activeDisputeCount={activeDisputeCount}
+        isX2Active={isX2Active}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+      />
+
+      {/* Main App Container */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6">
+        {activeTab === 'leaderboard' && (
+          <LeaderboardView
+            classes={classes}
+            selectedClassId={selectedClassId}
+            onSelectClass={setSelectedClassId}
+            onOpenClassDetail={(cls) => setSelectedClassForModal(cls)}
+            onAskAIForClass={handleAskAIForClass}
+            onNavigateToDispute={handleNavigateToDispute}
+            currentRole={currentRole}
+            isX2Active={isX2Active}
+          />
+        )}
+
+        {activeTab === 'cododo' && (
+          <RedScarfInspectionView
+            classes={classes}
+            onAddIncident={handleAddIncident}
+            isX2Active={isX2Active}
+            onAskAIAdvice={handleOpenAIChatWithPrompt}
+          />
+        )}
+
+        {activeTab === 'disputes' && (
+          <DisputeResolutionView
+            incidents={incidents}
+            currentRole={currentRole}
+            onResolveDispute={handleResolveDispute}
+            onSubmitDispute={handleSubmitDispute}
+            onAskAI={handleOpenAIChatWithPrompt}
+          />
+        )}
+
+        {activeTab === 'campaigns' && (
+          <CampaignConfigView
+            campaigns={campaigns}
+            onToggleX2={handleToggleX2}
+            auditLogs={auditLogs}
+            currentRole={currentRole}
+            onAskAI={handleOpenAIChatWithPrompt}
+            onOpenGoogleSheet={() => setIsSheetModalOpen(true)}
+          />
+        )}
+      </main>
+
+      {/* Floating Call-to-Action for AI Advisor */}
+      <div className="fixed bottom-6 right-6 z-40">
+        <button
+          onClick={() => handleOpenAIChatWithPrompt()}
+          className="flex items-center gap-2.5 px-4 py-3 bg-gradient-to-r from-red-600 via-rose-700 to-indigo-800 text-white font-extrabold text-xs rounded-2xl shadow-xl shadow-red-200 hover:scale-105 transition-all border border-red-400/40"
+        >
+          <Sparkles className="w-5 h-5 text-amber-300 animate-spin-slow" />
+          <div className="text-left hidden sm:block">
+            <div className="text-[10px] text-amber-300 uppercase tracking-wider font-mono">
+              CỐ VẤN THI ĐUA
+            </div>
+            <div>Cố Vấn AI Liên Đội</div>
+          </div>
+        </button>
+      </div>
+
+      {/* Google Sheet Database Modal */}
+      <GoogleSheetModal
+        isOpen={isSheetModalOpen}
+        onClose={() => setIsSheetModalOpen(false)}
+        config={googleSheetConfig}
+        onUpdateConfig={setGoogleSheetConfig}
+        onSyncSuccess={handleSyncSuccess}
+        currentClasses={classes}
+        currentIncidents={incidents}
+      />
+
+      {/* Awards & Certificate Modal */}
+      <AwardsReportModal
+        isOpen={isAwardsModalOpen}
+        onClose={() => setIsAwardsModalOpen(false)}
+        classes={classes}
+      />
+
+      {/* Class Detail Modal */}
+      <ClassDetailModal
+        cls={selectedClassForModal}
+        onClose={() => setSelectedClassForModal(null)}
+        incidents={incidents}
+        onAskAI={handleAskAIForClass}
+        onNavigateToDispute={handleNavigateToDispute}
+      />
+
+      {/* EduEmulate AI Advisor Chat Modal */}
+      <EduEmulateAIChatModal
+        isOpen={isAIChatOpen}
+        onClose={() => {
+          setIsAIChatOpen(false);
+          setAiPresetPrompt(undefined);
+        }}
+        currentRole={currentRole}
+        initialPrompt={aiPresetPrompt}
+        classes={classes}
+        onOpenApiKeySettings={() => {
+          setIsApiKeyMandatory(false);
+          setIsApiKeyModalOpen(true);
+        }}
+      />
+
+      {/* Gemini API Key & Model Settings Modal */}
+      <ApiKeySettingsModal
+        isOpen={isApiKeyModalOpen}
+        onClose={() => setIsApiKeyModalOpen(false)}
+        onSaved={(newKey) => {
+          setApiKey(newKey);
+          setIsApiKeyMandatory(false);
+          setToastMessage('Đã cập nhật cấu hình API Key & Model thành công!');
+          setTimeout(() => setToastMessage(null), 3500);
+        }}
+        isMandatory={isApiKeyMandatory}
+      />
+
+      {/* Footer */}
+      <footer className="bg-white border-t border-slate-200 py-4 text-center text-xs text-slate-500 mt-auto">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="font-extrabold text-slate-900">QUẢN LÝ THI ĐUA LIÊN ĐỘI TH&THCS</span>
+            <span>• Liên Đội Thiếu Niên Tiền Phong Hồ Chí Minh</span>
+          </div>
+          <div className="text-[11px] text-slate-400">
+            Cơ Sở Dữ Liệu Google Sheet Trực Tuyến • Cửa Sổ Đối Soát 24H • Radar 5 Cạnh • Cờ Luân Lưu
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+
+
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Custom scrollbars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
+
+import {StrictMode} from 'react';
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
