@@ -1,0 +1,6 @@
+{
+  "name": "EduEmulate K-12 - Quản trị Thi đua Học đường",
+  "description": "Hệ thống quản lý thi đua khen thưởng liên cấp K-12 tích hợp Đội Cờ Đỏ số, Cửa sổ đối soát 24h, Biểu đồ Radar 5 cạnh và Trợ lý AI EduEmulate Expert.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
